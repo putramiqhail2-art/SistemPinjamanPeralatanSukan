@@ -1,12 +1,10 @@
-
-// Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-import { getAnalytics } from "firebase/analytics";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
+// Import the functions you need from the SDKs you need using valid CDN URLs
+import { initializeApp } from "https://esm.run/firebase@10.8.0/app";
+import { getAnalytics } from "https://esm.run/firebase@10.8.0/analytics";
+import { getAuth } from "https://esm.run/firebase@10.8.0/auth";
+import { getFirestore } from "https://esm.run/firebase@10.8.0/firestore";
 
 // Your web app's Firebase configuration
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
   apiKey: "AIzaSyCgcE0GZ6GwX7ZkYEWzj7YvE5EK2nlJFHc",
   authDomain: "sistem-peralatan-sukan.firebaseapp.com",
@@ -20,3 +18,4 @@ const firebaseConfig = {
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const analytics = getAnalytics(app);
+export { app };
