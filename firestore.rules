@@ -1,0 +1,159 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function userPath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasProfile() { return exists(userPath()); }
+    function me() { return get(userPath()).data; }
+    function active() { return signedIn() && hasProfile() && me().accountStatus == 'active'; }
+    function isStaff() { return active() && me().role in ['sports_exco', 'admin', 'super_admin']; }
+    function isAdmin() { return active() && me().role in ['admin', 'super_admin']; }
+    function isSuper() { return active() && me().role == 'super_admin'; }
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+    function settingsPath() { return /databases/$(database)/documents/settings/system; }
+    function expireSecs() {
+      return (exists(settingsPath()) ? get(settingsPath()).data.expireMinutes : 10) * 60;
+    }
+    function reqPath(id) { return /databases/$(database)/documents/borrowRequests/$(id); }
+
+    // ---------- users ----------
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      // Self sign-up can ONLY create a student profile. Staff roles are set by admins / console.
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.accountStatus == 'active';
+      allow update:
+        // own profile details (cannot touch role / status)
+        if (signedIn() && request.auth.uid == uid && active()
+            && onlyChanges(['fullName', 'studentId', 'dorm', 'roomNumber', 'studyYear', 'updatedAt']))
+        // admin: change role/status. Only super_admin can touch admin accounts or grant admin.
+        || (isAdmin() && onlyChanges(['role', 'accountStatus', 'updatedAt'])
+            && (isSuper() ||
+                (resource.data.role in ['student', 'sports_exco']
+                 && request.resource.data.role in ['student', 'sports_exco'])));
+      allow delete: if false;
+    }
+
+    // ---------- catalogue ----------
+    match /equipmentTypes/{id} {
+      allow read: if active();
+      allow write: if isAdmin();
+    }
+
+    // ---------- individual units (Item IDs) ----------
+    match /equipmentUnits/{id} {
+      allow read: if active();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || (isStaff() && onlyChanges(['status', 'currentRequestId', 'reservedUntil', 'updatedAt']))
+        || (active() && onlyChanges(['status', 'currentRequestId', 'reservedUntil', 'updatedAt'])
+            && (studentReserves() || releases()));
+    }
+
+    // student takes an available (or lapsed-reservation) unit for a request created in the SAME transaction
+    function studentReserves() {
+      return request.resource.data.status == 'reserved'
+        && (resource.data.status == 'available'
+            || (resource.data.status == 'reserved' && resource.data.reservedUntil < request.time))
+        && request.resource.data.currentRequestId is string
+        && getAfter(reqPath(request.resource.data.currentRequestId)).data.studentUid == request.auth.uid
+        && getAfter(reqPath(request.resource.data.currentRequestId)).data.status == 'pending_collection'
+        && request.resource.data.reservedUntil
+           == getAfter(reqPath(request.resource.data.currentRequestId)).data.pickupExpiresAt;
+    }
+    // anyone may free a unit whose reservation time has passed (server time), or the owner may cancel
+    function releases() {
+      return resource.data.status == 'reserved'
+        && request.resource.data.status == 'available'
+        && (resource.data.reservedUntil < request.time
+            || (getAfter(reqPath(resource.data.currentRequestId)).data.status == 'cancelled'
+                && getAfter(reqPath(resource.data.currentRequestId)).data.studentUid == request.auth.uid));
+    }
+
+    // ---------- borrow requests ----------
+    match /borrowRequests/{id} {
+      allow read: if active() && (resource.data.studentUid == request.auth.uid || isStaff());
+
+      allow create: if active()
+        && request.resource.data.studentUid == request.auth.uid
+        && request.resource.data.status == 'pending_collection'
+        && request.resource.data.requestedAt == request.time
+        && request.resource.data.items.size() > 0 && request.resource.data.items.size() <= 30
+        && request.resource.data.pickupExpiresAt >= request.time + duration.value(expireSecs() - 120, 's')
+        && request.resource.data.pickupExpiresAt <= request.time + duration.value(expireSecs() + 120, 's');
+
+      allow update:
+        // staff: collect / return progress. Cannot collect after the pickup time has passed (server time).
+        if (isStaff()
+            && onlyChanges(['status', 'collectedAt', 'collectedBy', 'collectedByName', 'closedAt', 'updatedAt'])
+            && (request.resource.data.status != 'collected'
+                || (resource.data.status == 'pending_collection' && request.time <= resource.data.pickupExpiresAt)))
+        // student cancels own pending request
+        || (active() && resource.data.studentUid == request.auth.uid
+            && resource.data.status == 'pending_collection'
+            && request.resource.data.status == 'cancelled'
+            && onlyChanges(['status', 'updatedAt']))
+        // anyone: mark as expired once server time passed pickupExpiresAt
+        || (active() && resource.data.status == 'pending_collection'
+            && request.resource.data.status == 'expired'
+            && resource.data.pickupExpiresAt < request.time
+            && onlyChanges(['status', 'updatedAt']));
+
+      allow delete: if false;
+    }
+
+    // ---------- one row per physical unit in a request ----------
+    match /borrowItems/{id} {
+      allow read: if active() && (resource.data.studentUid == request.auth.uid || isStaff());
+      allow create: if active()
+        && request.resource.data.studentUid == request.auth.uid
+        && request.resource.data.status == 'reserved';
+      allow update: if isStaff()
+        || (active() && resource.data.status == 'reserved'
+            && onlyChanges(['status', 'updatedAt'])
+            && request.resource.data.status in ['expired', 'cancelled']
+            && getAfter(reqPath(resource.data.requestId)).data.status == request.resource.data.status
+            && (request.resource.data.status == 'expired' || resource.data.studentUid == request.auth.uid));
+      allow delete: if false;
+    }
+
+    // ---------- issues ----------
+    match /equipmentIssues/{id} {
+      allow read, create, update: if isStaff();
+      allow delete: if false;
+    }
+
+    // ---------- audit trail (append-only) ----------
+    match /activityLogs/{id} {
+      allow read: if isAdmin();
+      allow create: if active()
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    // ---------- settings ----------
+    match /settings/{id} {
+      allow read: if active();
+      allow write: if isAdmin();
+    }
+
+    // ---------- daily request-number counter ----------
+    match /counters/{id} {
+      allow read: if active();
+      allow create: if active() && request.resource.data.n == 1;
+      allow update: if active() && request.resource.data.n == resource.data.n + 1;
+    }
+
+    // ---------- server clock probe ----------
+    match /serverClock/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if signedIn() && request.auth.uid == uid && request.resource.data.t == request.time;
+    }
+  }
+}
